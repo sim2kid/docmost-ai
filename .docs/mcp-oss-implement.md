@@ -30,6 +30,11 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - **Approach B (Audit-only)**: Skip table changes; rely solely on the `mcp_audit_events` table to link the action to the key.
 - **Decision Required**: Pick one approach in Phase 1. Recommended: **Approach B** (audit-only) to avoid disruptive schema migrations on core tables in the OSS release.
 
+### 1.1.3 Audit Context Attribution Update
+- Update the core `AuditContext` type and `AuditActorInterceptor` so audit logs can optionally track `apiKeyId` alongside the impersonated human user.
+- The `McpContextFactory` should populate the audit context with `actorType: 'api_key'`, the creator's `actorId`, and the active `apiKeyId` for downstream logging.
+- This keeps machine actions attributable without losing the human creator link used by existing audit flows.
+
 ### 1.1.2 Attribution Transparency (UI Visibility)
 - **Risk**: Docmost's primary audit system may be Enterprise-Edition only. If `mcp_audit_events` is treated as an EE feature, OSS users will lose the UI transparency ("Creator Name (via AI)").
 - **Mitigation**:
@@ -41,7 +46,7 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 ### 1.2 `ApiKeyModule` Implementation
 - **`ApiKeyRepo`**: CRUD operations for keys and grants.
 - **`ApiKeyService`**: 
-    - **Token Generation**: `dmk_<public_id>_<secret>_<checksum>`. Checksum is HMAC-SHA256 of public_id + secret using a system secret, calculated before hashing.
+    - **Token Generation**: `dmk_<public_id>_<secret>_<checksum>`. Checksum is HMAC-SHA256 of `public_id + secret` using a server-side secret, truncated to a short stable prefix (for example, the first 8 hex characters), and calculated before hashing.
     - **Secret Storage**: Use `argon2id` for hashing. Plaintext secret shown only once at creation.
     - **Validation Flow**: Parse token $\rightarrow$ Verify checksum $\rightarrow$ Lookup by `public_id` $\rightarrow$ Verify hash $\rightarrow$ Check status/expiry $\rightarrow$ Return `McpPrincipal`.
     - **Grant Management**: Update grants with validation that the creator's current role $\ge$ requested scope.
@@ -68,6 +73,7 @@ The implementation follows a phased approach to minimize risk, ensuring that the
     - **Space Resolution**: Extract `spaceId` from params.
     - **Intersection Check**: `Effective = min(KeyGrant, CreatorCurrentRole, PageRestriction)`.
 - Integrate with `SpaceMemberRepo` to resolve the creator's current highest role (direct or group).
+- Use table-driven tests for `authorize` to cover the key intersection cases, including `read_write` vs `reader`, `read_only` vs `writer`, and creator removal from space.
 
 ### 2.2 Page-Level Restriction Integration
 - Ensure all tool calls delegate to existing domain services (e.g., `PageService`) using the creator's user context to enforce page-level restrictions.
@@ -160,7 +166,8 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 
 ### 4.2 Search & Discovery Tools
 - `search_pages` (with space filtering and result caps).
-    - **Space Limit**: When the caller does not supply a `spaceId` (i.e., a global search), the handler must validate `spaceIds.length` (derived from the key's grants) against a `MAX_SPACES_PER_SEARCH` constant (e.g., 20). If exceeded, reject the call with `FORBIDDEN` to prevent resource exhaustion.
+- **Space Limit**: When the caller does not supply a `spaceId` (i.e., a global search), the handler must validate `spaceIds.length` (derived from the key's grants) against a `MAX_SPACES_PER_SEARCH` constant (e.g., 20). If exceeded, reject the call with `FORBIDDEN` to prevent resource exhaustion.
+    - **Default**: `MAX_SPACES_PER_SEARCH = 20`.
     - **Result Limit**: Apply the `McpResponseTruncator` (Phase 3.3) to cap returned hits.
     - **Search Quality**: Support fuzzy title matching, `title_only` / `content_only` filters, `lastModifiedBy`, `updatedSince`, and breadcrumb/path metadata in results.
 - `get_comments`

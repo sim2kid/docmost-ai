@@ -176,7 +176,7 @@ Where:
 
 - `<public_id>` is a non-secret identifier used for lookup
 - `<secret>` is a high-entropy random secret shown only once at creation time
-- `<checksum>` is a small CRC or checksum of the secret calculated before hashing, allowing the server to reject malformed keys before database lookup or expensive hash verification
+- `<checksum>` is an HMAC-SHA256 checksum of `public_id + secret` using a server-side secret, truncated to a short stable prefix (for example, the first 8 hex characters) so the server can reject malformed keys before database lookup or expensive hash verification
 
 
 
@@ -394,27 +394,28 @@ The current UI already lists the intended tool set:
 The sections below define intended behavior, minimum input expectations, and authorization rules.
 
 ### Actor Attribution and Audit
-+
-+When an action is performed via an API key, the system must track both the human creator and the specific key used.
-+
-+- **Attribution**: Actions (e.g., creating a comment, updating a page) should be tagged with the `apiKeyId` in the database/audit logs.
-+- **UI Transparency**: In the user interface, actions performed via MCP should be visually distinguished (e.g., `Creator Name (via AI)`) to ensure transparency.
-+- **Tool Usage Logging**: Every successful and failed tool call must be logged, including `toolName`, `targetResourceId` (e.g., `pageId`), and `apiKeyId`.
-+
+
+When an action is performed via an API key, the system must track both the human creator and the specific key used.
+
+- **Attribution**: Actions (e.g., creating a comment, updating a page) should be tagged with the `apiKeyId` in the database/audit logs.
+- **UI Transparency**: In the user interface, actions performed via MCP should be visually distinguished (e.g., `Creator Name (via AI)`) to ensure transparency.
+- **Tool Usage Logging**: Every successful and failed tool call must be logged, including `toolName`, `targetResourceId` (e.g., `pageId`), and `apiKeyId`.
+
 ### Authorization Latency & Caching
-+
-+Because effective access must be lost "immediately" upon creator downgrade:
-+
-+- The `McpAuthorizationService` must ensure it does not rely on stale permission caches for high-security write operations.
-+- If standard permission caching is used, the implementation must ensure that membership/role changes trigger immediate cache invalidation for associated API keys.
-+
+
+Because effective access must be lost "immediately" upon creator downgrade:
+
+- The `McpAuthorizationService` must ensure it does not rely on stale permission caches for high-security write operations.
+- If standard permission caching is used, the implementation must ensure that membership/role changes trigger immediate cache invalidation for associated API keys.
+
 ### Search Scope & Performance
-+
-+To prevent resource exhaustion when searching across many granted spaces:
-+
-+- Introduce a "max spaces" limit for a single search request.
-+- Enforce strict timeouts at the transport layer for search operations.
-+
+
+To prevent resource exhaustion when searching across many granted spaces:
+
+- Introduce a `MAX_SPACES_PER_SEARCH` limit for a single search request.
+- Recommended default: `20` spaces per broad search.
+- Enforce strict timeouts at the transport layer for search operations.
+
 ### Tool Response Size Constraints
 
 To prevent transport failures or AI context window overflow:
