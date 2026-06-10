@@ -171,12 +171,13 @@ Use opaque API keys as bearer credentials.
 Recommended token shape:
 
 - `dmk_<public_id>_<secret>_<checksum>`
-+
-+Where:
-+
-+- `<public_id>` is a non-secret identifier used for lookup
-+- `<secret>` is a high-entropy random secret shown only once at creation time
-+- `<checksum>` is a small CRC or checksum of the secret to allow the server to reject malformed keys before database lookup
+
+Where:
+
+- `<public_id>` is a non-secret identifier used for lookup
+- `<secret>` is a high-entropy random secret shown only once at creation time
+- `<checksum>` is a small CRC or checksum of the secret calculated before hashing, allowing the server to reject malformed keys before database lookup or expensive hash verification
+
 
 
 ### Storage Requirements
@@ -286,7 +287,8 @@ Suggested fields:
 - `secret_hash`
 - `status` such as `active` or `revoked`
 - `expires_at` nullable
-- `last_used_at` nullable
+- `last_used_at` nullable (updated via throttled strategy, e.g., only once per hour or asynchronously, to avoid DB write contention)
+
 - `created_at`
 - `updated_at`
 - `revoked_at` nullable
@@ -391,7 +393,15 @@ The sections below define intended behavior, minimum input expectations, and aut
 +- Introduce a "max spaces" limit for a single search request.
 +- Enforce strict timeouts at the transport layer for search operations.
 +
+### Tool Response Size Constraints
+
+To prevent transport failures or AI context window overflow:
+
+- The MCP server must truncate tool outputs at a safe limit (e.g., 100KB).
+- When truncation occurs, the response must include a truncated indicator so the AI knows it only has a partial view of the content.
+
 ## Common Tool Rules
+
 
 
 ### Read vs Write Classification
