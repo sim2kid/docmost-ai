@@ -127,6 +127,11 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - **Storage**: Write to the existing audit event pipeline or a dedicated `mcp_audit_events` table with proper indexing on `api_key_id` and `created_at`.
 - **Redaction**: Ensure `params` and `content` payloads are redacted or size-capped to prevent log storage abuse.
 
+#### 3.4.1 Audit Context Plumbing
+- Extend the shared `AuditContext` type to allow an optional `apiKeyId` field.
+- Update `AuditActorInterceptor` so that when the request is impersonated through `McpContextFactory`, the interceptor records both the human `user.id` and the active `apiKeyId`.
+- Preserve existing behavior for normal human-authenticated requests.
+
 ### 3.5 Rate Limiting (`McpThrottlerGuard`)
 - MCP endpoints must be protected against abuse and resource exhaustion.
 - Implement an **`McpThrottlerGuard`** (or use NestJS `@nestjs/throttler`) scoped to the `/api/mcp` route.
@@ -245,7 +250,11 @@ To ensure the foundation is solid before building the UI or exposing tools, the 
 - **Success Criteria**: `health` endpoint returns `200 OK`; revoked/expired/invalid keys return `401 Unauthorized`.
 
 ### Checkpoint 2: The Intersection Test (Post-Phase 2)
-- **Test**: Write a unit test for `McpAuthorizationService` with a key having `read_write` grant for Space A, but the creator's current role in Space A is `reader`.
+- **Test**: Write table-driven unit tests for `McpAuthorizationService` covering:
+    - `Key: read_write` + `Creator: reader` → `FORBIDDEN` for writes
+    - `Key: read_only` + `Creator: writer` → `FORBIDDEN` for writes
+    - `Key: read_write` + `Creator: null` (removed from space) → `NOT_FOUND` or `FORBIDDEN`
+    - `Key: read_write` + `Creator: writer` + `Page: restricted` → `NOT_FOUND`
 - **What it Validates**:
     - The "Permission Ceiling" logic.
     - Correct space membership resolution via `SpaceMemberRepo`.

@@ -414,6 +414,7 @@ To prevent resource exhaustion when searching across many granted spaces:
 
 - Introduce a `MAX_SPACES_PER_SEARCH` limit for a single search request.
 - Recommended default: `20` spaces per broad search.
+- Recommended default: `20` spaces per broad search.
 - Enforce strict timeouts at the transport layer for search operations.
 
 ### Tool Response Size Constraints
