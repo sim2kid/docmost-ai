@@ -22,6 +22,10 @@ Observed facts:
 - `WorkspaceService` currently license-gates `mcpEnabled`, so OSS MCP enablement must explicitly remove or adjust that gating.
 - The client already has EE-only MCP/settings and API key UI hints, but OSS-ready shared UI does not yet exist.
 - `AuditContext` already supports `actorType: 'api_key'`, which means attribution should extend existing audit plumbing rather than invent a separate model.
+- `DomainMiddleware` populates `request.raw.workspace` and `request.raw.workspaceId`, and many existing controllers/decorators assume those fields exist.
+- The repo already supports raw-response handlers with `@SkipTransform()`, which is the correct transport fit for MCP protocol endpoints.
+- `CommentService.update(...)` only allows the original comment creator to edit comments.
+- OSS page search currently relies on the Postgres-backed `SearchService` unless an EE Typesense path is present and configured.
 
 ## Problem Statement
 
@@ -168,6 +172,7 @@ Responsibilities:
 - delegate into current domain services
 - normalize protocol-safe errors
 - apply truncation and throttling
+- preserve workspace-context compatibility expected elsewhere in the app
 
 This belongs under `integrations` because it is a protocol/interface layer over existing domains.
 
@@ -268,6 +273,8 @@ MCP transport may require raw protocol envelopes. Therefore, MCP routes must exp
 
 This is a design-critical requirement, not an implementation detail to discover late.
 
+The repo already supports this via `@SkipTransform()`.
+
 ## Transport replaceability
 
 Business rules must not be tied to a specific SDK.
@@ -285,16 +292,17 @@ So that the underlying MCP transport implementation can be changed without rewri
 ## Request Lifecycle
 
 1. request hits `/mcp`
-2. MCP auth guard extracts bearer token
-3. `ApiKeyService` validates token and loads grants
-4. MCP principal is attached to the request
-5. registry resolves target tool
-6. authorization service computes effective capability
-7. context factory builds creator-backed execution context
-8. existing domain services perform the operation
-9. result is truncated/sanitized if needed
-10. audit event is recorded
-11. protocol response is returned
+2. workspace is resolved or preserved using the same domain/hostname model the app already uses
+3. MCP auth guard extracts bearer token
+4. `ApiKeyService` validates token and loads grants
+5. MCP principal is attached to the request
+6. registry resolves target tool
+7. authorization service computes effective capability
+8. context factory builds creator-backed execution context
+9. existing domain services perform the operation
+10. result is truncated/sanitized if needed
+11. audit event is recorded
+12. protocol response is returned without standard API wrapping
 
 ## Domain Delegation Rule
 
@@ -334,6 +342,8 @@ Recommended audit context fields:
 - `actorId = creator user id`
 - `actorType = 'api_key'`
 - `apiKeyId = active key id`
+
+Audit payloads must remain bounded and must not duplicate large content bodies.
 
 ## Audit event model
 
@@ -418,7 +428,8 @@ The first OSS launch should include:
 - `create_page`
 - `update_page`
 - `create_comment`
-- `update_comment` only if current comment rules map cleanly to delegated actor behavior
+
+`update_comment` should be deferred from the guaranteed initial scope because the current repo only allows the original comment creator to edit comments.
 
 ## Deferred tools
 
@@ -485,6 +496,7 @@ Suggested fields:
 - restrict to granted spaces only
 - no unauthorized snippets, counts, or hits
 - broad search must obey `MAX_SPACES_PER_SEARCH`
+- initial implementation should target the current OSS `SearchService` path rather than depend on EE Typesense modules
 
 ### `create_page`
 
@@ -500,7 +512,7 @@ Suggested fields:
 ### `get_comments`, `create_comment`, `update_comment`
 
 - all comment operations remain subordinate to page visibility and current comment business rules
-- if comment update semantics prove user-author-bound in a way that cannot safely support delegated editing, defer `update_comment`
+- because current comment update semantics are already user-author-bound, defer `update_comment` unless authorship/edit rules are intentionally revised
 
 ## Resources and Prompts
 

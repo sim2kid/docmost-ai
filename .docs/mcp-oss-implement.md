@@ -13,6 +13,10 @@ Before implementation begins, the following repository realities must shape the 
 - `JwtStrategy` currently hard-depends on an EE API key validation path and must be decoupled for OSS.
 - `AuditContext` already supports `actorType: 'api_key'`, so the audit integration work should extend existing plumbing instead of inventing a parallel audit model.
 - No verified `argon2` or `bcrypt` dependency is currently present in the repo. The implementation must either add one explicitly or use an existing approved crypto path after verification. This must not be left implicit.
+- Many existing controllers and decorators assume `request.raw.workspace`, `request.raw.workspaceId`, or `@AuthWorkspace()` are already available via `DomainMiddleware`; MCP must preserve that workspace context shape.
+- The repo already supports raw-response bypass via `@SkipTransform()`, which should be used for MCP protocol handlers.
+- `CommentService.update(...)` currently allows only the original comment creator to edit a comment, making `update_comment` unsafe for guaranteed initial scope.
+- OSS `search_pages` should target the current Postgres-backed `SearchService` path and must not depend on EE Typesense modules.
 
 ## Delivery Principle
 
@@ -38,7 +42,6 @@ Ship first:
   - `create_page`
   - `update_page`
   - `create_comment`
-  - `update_comment`
 
 Defer from initial OSS launch:
 
@@ -50,6 +53,7 @@ Defer from initial OSS launch:
 - `move_page_to_space`
 - `search_attachments`
 - `list_workspace_members`
+- `update_comment`
 - prompt/resource subscription complexity beyond basic resources/prompts
 
 These deferred items are either high-risk for exfiltration/integrity or do not map cleanly to the current per-space grant model.
@@ -71,12 +75,14 @@ These deferred items are either high-risk for exfiltration/integrity or do not m
 
 - Use `/mcp` as the transport endpoint to match `apps/server/src/main.ts`.
 - Keep REST-style API key management endpoints under `/api/...`.
+- Ensure `/mcp` requests still resolve workspace identity through the same self-host/cloud domain model used elsewhere in the app.
 
 ### 0.3 Confirm OSS feature behavior
 
 - Remove or relax current EE-only gating for `mcpEnabled` in `WorkspaceService` where required for OSS launch.
 - Ensure API key management is not gated behind `Feature.API_KEYS` in an EE-only path.
 - Decide whether OSS will expose workspace-level toggle UI for MCP immediately or infer enablement from API key/module availability.
+- Defer `update_comment` by default unless product explicitly approves a change to current comment ownership/edit semantics.
 
 ### 0.4 Confirm schema migration strategy
 
@@ -261,6 +267,16 @@ Response rules:
 - `POST` returns the one-time plaintext token plus metadata
 - `GET`/`PATCH` never return the secret or full token
 
+### Workspace binding requirement
+
+These endpoints should continue using the normal `/api` request path with `DomainMiddleware` and `@AuthWorkspace()`.
+
+All API-key CRUD operations must enforce:
+
+- key workspace equals authenticated workspace
+- creator user belongs to authenticated workspace
+- cross-workspace access fails closed
+
 ## 1.6 Auth integration cleanup
 
 ### Option A: preferred for MCP
@@ -276,6 +292,7 @@ This guard should:
 - extract bearer token
 - call `ApiKeyService.validateBearerToken`
 - attach `{ principal, user, workspace }`-style request context for MCP handlers
+- populate `request.raw.workspaceId` and `request.raw.workspace` when needed so downstream workspace-dependent code remains compatible
 
 ### Option B: cleanup legacy JWT API-key support
 
@@ -352,6 +369,16 @@ Instead:
 - route reads/mutations through existing domain services/repo flows already used by controllers
 - run those calls with a creator-backed user context so the same restrictions apply
 
+### Search implementation constraint
+
+Initial MCP `search_pages` must use the OSS `SearchService` behavior as the baseline.
+
+Rules:
+
+- do not depend on EE Typesense modules
+- preserve existing permission filtering behavior
+- layer any extra MCP response shaping on top of already-filtered OSS results
+
 ## 2.5 Creator context factory
 
 Add:
@@ -363,6 +390,12 @@ Responsibilities:
 - convert `McpPrincipal` into the user/workspace context expected by existing services
 - annotate request/audit context with `actorType: 'api_key'`
 - preserve the human creator identity while carrying `apiKeyId` in metadata
+
+Compatibility requirements:
+
+- set the request user/workspace shape expected by decorators and interceptors when handlers reuse existing conventions
+- preserve `request.raw.workspace` and `request.raw.workspaceId`
+- avoid fabricating unrelated browser-session fields
 
 This factory should be the only supported bridge from MCP transport to domain services.
 
@@ -428,6 +461,10 @@ Because the app uses a global `TransformHttpResponseInterceptor`, the MCP transp
 Implementation requirement:
 
 - explicitly bypass or disable the standard response wrapper for MCP protocol routes if the MCP client expects raw JSON-RPC/SSE payloads
+
+Repository-fit detail:
+
+- use `@SkipTransform()` on MCP protocol handlers
 
 This is a critical slot-in detail and must be validated early.
 
@@ -544,6 +581,16 @@ Instead, define a minimal attribution follow-up:
 
 This keeps Phase 1-5 feasible and avoids invasive core-table attribution changes in the first OSS release.
 
+## 4.5 Audit metadata limits
+
+MCP audit payloads must be bounded.
+
+Rules:
+
+- never log full page or comment bodies by default
+- truncate serialized params summaries aggressively
+- prefer ids, tool names, and reason codes over payload duplication
+
 ---
 
 ## Phase 5: Read Tool Delivery
@@ -626,6 +673,17 @@ Prompts:
 
 Do not let resources/prompts delay the core tool delivery.
 
+## 5.4 Search result parity
+
+The current OSS search path returns filtered page search results with highlight/rank-oriented fields.
+
+MCP `search_pages` should either:
+
+- adapt that current result set directly, or
+- transform it into an MCP-friendly shape without expanding visibility or depending on unimplemented metadata
+
+Do not promise search capabilities beyond what the current OSS search path can actually support unless they are separately implemented.
+
 ---
 
 ## Phase 6: Mutation Tool Delivery
@@ -637,6 +695,9 @@ Do not let resources/prompts delay the core tool delivery.
 - `create_page`
 - `update_page`
 - `create_comment`
+
+Defer by default:
+
 - `update_comment`
 
 ## 6.2 Mutation safety rules
@@ -663,8 +724,9 @@ Repository-fit rule:
 
 ### `update_comment`
 
-- defer if current comment edit rules are tightly user-author specific and do not map cleanly to delegated credentials
-- otherwise route through current comment service rules without bypasses
+- current repo behavior only allows the original comment creator to edit the comment
+- because MCP actions execute through delegated API-key context, this creates an ownership mismatch for comments authored previously by the human user or another automation run
+- therefore `update_comment` should be deferred from the first implementation unless authorship/edit rules are intentionally redesigned
 
 ## 6.3 Explicitly deferred structural tools
 
@@ -748,6 +810,7 @@ Using an MCP client/inspector, verify:
 
 - `/mcp` returns raw protocol-compatible payloads
 - global HTTP response wrapping does not corrupt MCP responses
+- workspace resolution still works on `/mcp` in self-hosted and cloud hostname modes
 
 ## Checkpoint 4: Read Tools
 
@@ -757,6 +820,7 @@ Verify:
 - `get_page` respects page restrictions
 - `search_pages` does not leak unauthorized snippets/counts
 - truncation metadata is present on oversized responses
+- `search_pages` works through the OSS Postgres-backed search path without Typesense
 
 ## Checkpoint 5: Mutation Safety
 
@@ -806,8 +870,10 @@ Expected backend files to add or change:
 - `apps/server/src/integrations/mcp/services/mcp-context.factory.ts`
 - `apps/server/src/integrations/mcp/tools/*`
 - `apps/server/src/integrations/mcp/utils/mcp-response-truncator.ts`
+- `apps/server/src/common/middlewares/domain.middleware.ts` only if MCP workspace compatibility requires a targeted update
 - `apps/server/src/common/middlewares/audit-context.middleware.ts`
 - `apps/server/src/common/interceptors/audit-actor.interceptor.ts`
+- `apps/server/src/common/decorators/skip-transform.decorator.ts` reused for MCP handlers
 - `apps/server/src/core/auth/strategies/jwt.strategy.ts` if legacy API-key cleanup is included
 - `apps/server/src/integrations/throttle/throttler-names.ts`
 - `apps/server/src/integrations/throttle/*` as needed for MCP throttling
@@ -835,7 +901,9 @@ That means:
 - use dedicated opaque-token MCP auth rather than forcing everything through JWT
 - reuse existing page/comment/space permission services wherever possible
 - reuse the existing audit pipeline with minimal extensions
+- preserve workspace-resolution assumptions already used throughout the app
+- use `@SkipTransform()` for protocol handlers
 - ship a narrow, high-confidence tool set first
-- defer structurally risky tools until the delegated authorization model is proven in OSS
+- defer structurally risky tools and `update_comment` until the delegated authorization model is proven in OSS
 
 If executed in this order, the result should slot into Docmost cleanly without depending on EE-only modules or introducing a parallel authorization model.
