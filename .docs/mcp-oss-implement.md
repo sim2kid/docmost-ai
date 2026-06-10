@@ -40,8 +40,8 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - **Mitigation**:
     - The `mcp_audit_events` table must be created and readable in **OSS**, not deferred to EE.
     - Modify `PageService.findOne` and `CommentService.findOne` (or their response DTOs) to join against `mcp_audit_events` (e.g., the latest `mcp.tool.invoked` event for that resource) and return a `wasAIGenerated: boolean` and `lastUpdatedByApiKeyName: string` field.
+    - If the main audit viewer remains EE-only, expose this machine-attribution data through a dedicated OSS-accessible response path or DTO so the frontend can render `Creator Name (via AI)` consistently.
     - The frontend will read this flag and render `Creator Name (via AI)` in the UI, ensuring transparency without requiring the full EE audit log viewer.
-- Ensure downstream consumers (e.g., the editor UI) can read attribution data to render `Creator Name (via AI)`.
 
 ### 1.2 `ApiKeyModule` Implementation
 - **`ApiKeyRepo`**: CRUD operations for keys and grants.
@@ -131,6 +131,7 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - Extend the shared `AuditContext` type to allow an optional `apiKeyId` field.
 - Update `AuditActorInterceptor` so that when the request is impersonated through `McpContextFactory`, the interceptor records both the human `user.id` and the active `apiKeyId`.
 - Preserve existing behavior for normal human-authenticated requests.
+- This work belongs to Phase 3.4 so the machine-actor audit path is available before mutation tools ship.
 
 ### 3.5 Rate Limiting (`McpThrottlerGuard`)
 - MCP endpoints must be protected against abuse and resource exhaustion.
@@ -176,7 +177,6 @@ The implementation follows a phased approach to minimize risk, ensuring that the
     - **Result Limit**: Apply the `McpResponseTruncator` (Phase 3.3) to cap returned hits.
     - **Search Quality**: Support fuzzy title matching, `title_only` / `content_only` filters, `lastModifiedBy`, `updatedSince`, and breadcrumb/path metadata in results.
 - `get_comments`
-- `search_attachments` (with strict visibility checks).
 - `get_page_by_path`
 - `list_pages_recursive`
 - `list_recent_activity`
@@ -193,6 +193,7 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - `create_comment`
 - `update_comment`
 
+- `update_page` schema must include an optional `expectedUpdatedAt` or `version` parameter so the server can detect stale writes.
 - `update_page` must support optimistic concurrency via `version` or `updatedAt` checks so AI edits do not overwrite concurrent human edits.
 - If the editor stack exposes a collaborative document patch path, prefer that over full-body replacement.
 
@@ -217,6 +218,10 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - Distinguish title matches from content matches.
 - Surface a concise page outline for quick jumping.
 - Provide recent-activity views to support AI and human discovery.
+
+### 6.4 Attachment Search
+- `search_attachments` (deferred until Phase 6 after the core authorization engine is validated)
+- Keep attachment metadata search subject to strict visibility checks and the same response truncation rules as other discovery tools.
 
 ### 6.2 MCP Settings UI
 - Endpoint URL display.
@@ -269,3 +274,11 @@ To ensure the foundation is solid before building the UI or exposing tools, the 
     - Read-only authorization is enforced at the transport boundary.
     - `McpAuditService` records the invocations.
 - **Success Criteria**: `mcp-inspector` successfully lists the granted spaces and returns a synthetic principal from `get_current_user`. Attempting an unauthorized read (e.g., a space not in the grants) is denied with a non-enumerating error.
+
+### Checkpoint 4: The Mutation Safety Test (Post-Phase 5)
+- **Test**: Call `update_page` with a stale `expectedUpdatedAt` or `version` value after a human edit has advanced the page.
+- **What it Validates**:
+    - Optimistic locking rejects stale writes.
+    - Mutation audit logs record the write with the correct `apiKeyId` and `actorType`.
+    - No concurrent human changes are overwritten silently.
+- **Success Criteria**: The stale update fails with a conflict-style error, and the corresponding audit record contains the machine attribution fields.

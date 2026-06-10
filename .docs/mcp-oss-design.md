@@ -414,7 +414,6 @@ To prevent resource exhaustion when searching across many granted spaces:
 
 - Introduce a `MAX_SPACES_PER_SEARCH` limit for a single search request.
 - Recommended default: `20` spaces per broad search.
-- Recommended default: `20` spaces per broad search.
 - Enforce strict timeouts at the transport layer for search operations.
 
 ### Tool Response Size Constraints
@@ -465,6 +464,7 @@ Recommended normalized errors:
 - `NOT_FOUND`
 - `VALIDATION_ERROR`
 - `CONFLICT`
+- `RATE_LIMITED`
 - `INTERNAL_ERROR`
 
 To avoid unauthorized resource enumeration, prefer `NOT_FOUND` when revealing the existence of an object would leak information.
