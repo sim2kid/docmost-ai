@@ -204,7 +204,7 @@ The secret should be hashed using a password-grade algorithm such as Argon2id or
 
 For each MCP request:
 
-1. Read bearer token from `Authorization` header
+1. Read bearer token from `Authorization: Bearer <token>` header (standard convention to ensure compatibility with proxies and infrastructure)
 2. Parse token into public identifier and secret
 3. Look up the API key by public identifier
 4. Verify secret hash

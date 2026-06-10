@@ -29,6 +29,13 @@ The implementation follows a phased approach to minimize risk, ensuring that the
     - `comments`: add `created_by_api_key_id`
 - **Approach B (Audit-only)**: Skip table changes; rely solely on the `mcp_audit_events` table to link the action to the key.
 - **Decision Required**: Pick one approach in Phase 1. Recommended: **Approach B** (audit-only) to avoid disruptive schema migrations on core tables in the OSS release.
+
+### 1.1.2 Attribution Transparency (UI Visibility)
+- **Risk**: Docmost's primary audit system may be Enterprise-Edition only. If `mcp_audit_events` is treated as an EE feature, OSS users will lose the UI transparency ("Creator Name (via AI)").
+- **Mitigation**:
+    - The `mcp_audit_events` table must be created and readable in **OSS**, not deferred to EE.
+    - Modify `PageService.findOne` and `CommentService.findOne` (or their response DTOs) to join against `mcp_audit_events` (e.g., the latest `mcp.tool.invoked` event for that resource) and return a `wasAIGenerated: boolean` and `lastUpdatedByApiKeyName: string` field.
+    - The frontend will read this flag and render `Creator Name (via AI)` in the UI, ensuring transparency without requiring the full EE audit log viewer.
 - Ensure downstream consumers (e.g., the editor UI) can read attribution data to render `Creator Name (via AI)`.
 
 ### 1.2 `ApiKeyModule` Implementation
@@ -45,7 +52,8 @@ The implementation follows a phased approach to minimize risk, ensuring that the
     - `DELETE /api/api-keys/:id`: Revoke key.
 
 ### 1.3 Auth Strategy Integration
-- Implement `ApiKeyStrategy` (extending `PassportStrategy` or custom guard) to handle `X-API-Key` header.
+- Implement `ApiKeyStrategy` (extending `PassportStrategy` or custom guard) to handle the `Authorization: Bearer <token>` header.
+- **Standardized Header**: Use the standard `Authorization: Bearer <token>` convention for MCP requests. Do not use a custom `X-API-Key` header, as some proxies and infrastructure components strip or block non-standard headers.
 - Remove the dynamic `require` of the enterprise API key service from `JwtStrategy` to decouple OSS auth from EE modules.
 - Implement `McpAuthGuard` to protect `/api/mcp` routes and attach the `McpPrincipal` to the request.
 
@@ -75,8 +83,10 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - `ApiKeyModule` will need to consult the `SpaceModule` (for membership lookups) and `UserModule` (for creator validation). The `McpModule` will depend on `ApiKeyModule`, `PageModule`, `SpaceModule`, and `CommentModule`.
 - To prevent circular dependencies:
     - **`forwardRef`**: Use `forwardRef(() => ApiKeyModule)` in module imports where strictly necessary.
-    - **Extract Permission Logic**: Abstract the "creator role vs space grant" intersection logic into a standalone `PermissionService` that has no dependencies on the MCP layer. Both `ApiKeyService` and `McpAuthorizationService` can depend on it.
+    - **Extract Permission Logic (Low-Level)**: Abstract the "creator role vs space grant" intersection logic into a standalone `PermissionService` that lives in a low-level `common` or `core` module (e.g., `apps/server/src/common/permission/`).
+    - **Critical Rule**: The low-level `PermissionService` must **not** import from `PageModule`, `SpaceModule`, or `McpModule`. It should only consume abstract repository contracts or generic interfaces.
     - **Interface Segregation**: `ApiKeyModule` should expose a minimal `McpPrincipal` interface, not a concrete class, so consumers don't need to import the full module type graph.
+    - **Provider Pattern**: If `PermissionService` needs page or space data, those higher-level modules should provide implementations of a generic `PermissionProvider` interface that the low-level module consumes via injection tokens.
 
 
 ---
@@ -110,6 +120,17 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - **Storage**: Write to the existing audit event pipeline or a dedicated `mcp_audit_events` table with proper indexing on `api_key_id` and `created_at`.
 - **Redaction**: Ensure `params` and `content` payloads are redacted or size-capped to prevent log storage abuse.
 
+### 3.5 Rate Limiting (`McpThrottlerGuard`)
+- MCP endpoints must be protected against abuse and resource exhaustion.
+- Implement an **`McpThrottlerGuard`** (or use NestJS `@nestjs/throttler`) scoped to the `/api/mcp` route.
+- **Multi-Layer Limits**: Configure distinct throttles for:
+    - **Per-IP**: To block single-source flooding (e.g., 100 req/min).
+    - **Per-API-Key**: To prevent a single compromised key from monopolizing resources (e.g., 60 req/min).
+    - **Per-Workspace**: To prevent a workspace-wide flood (e.g., 1000 req/min).
+- **Stricter Limits for Writes**: Mutating tools (`create_page`, `update_page`, etc.) must have a significantly lower rate limit (e.g., 10 req/min) than read tools.
+- **Response**: When a limit is hit, return the standardized `RATE_LIMITED` error code and log a `mcp.tool.denied` event with reason `RATE_LIMITED`.
+
+
 
 ---
 
@@ -126,6 +147,8 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 
 ### 4.2 Search & Discovery Tools
 - `search_pages` (with space filtering and result caps).
+    - **Space Limit**: When the caller does not supply a `spaceId` (i.e., a global search), the handler must validate `spaceIds.length` (derived from the key's grants) against a `MAX_SPACES_PER_SEARCH` constant (e.g., 20). If exceeded, reject the call with `FORBIDDEN` to prevent resource exhaustion.
+    - **Result Limit**: Apply the `McpResponseTruncator` (Phase 3.3) to cap returned hits.
 - `get_comments`
 - `search_attachments` (with strict visibility checks).
 
