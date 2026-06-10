@@ -2,462 +2,392 @@
 
 ## Purpose
 
-This document defines the proposed design for bringing Docmost MCP support into the open-source version of the repository.
+This document defines a repository-fit design for bringing MCP support into Docmost OSS.
 
-The immediate goal is to support AI integrations through an MCP server authenticated by API key, with access limited explicitly by space.
+The immediate goal is to expose a secure MCP server for AI assistants using delegated API-key authentication with explicit per-space access.
 
-This document is intended to be the working implementation spec for the first iteration.
+This design is intentionally narrower than a full enterprise feature port. It is optimized to slot into the existing OSS codebase with minimal duplication of business rules and minimal dependence on EE-only paths.
 
-## Background
+## Current Repository Reality
 
-The repository already contains evidence of enterprise-only MCP support and API key authentication paths:
+The design must match the codebase that already exists.
 
-- Client enterprise MCP settings UI exists in `apps/client/src/ee/ai/components/mcp-settings.tsx`
-- The `mcp` feature flag already exists in `apps/server/src/common/features.ts`
-- API key JWT payload support already exists in `apps/server/src/core/auth/dto/jwt-payload.ts`
-- `TokenService` can already generate API-key JWTs in `apps/server/src/core/auth/services/token.service.ts`
-- OSS currently cannot validate API keys because `JwtStrategy` dynamically loads the API key service from `ee` and throws if the enterprise module is missing
+Observed facts:
 
-This means the repo already has some of the plumbing, but the OSS version does not yet have a first-class API key implementation or an MCP server implementation available without enterprise code.
+- The backend is NestJS/Fastify under `apps/server/src`.
+- `main.ts` excludes `mcp` from the global `/api` prefix, which strongly indicates the MCP transport should live at `/mcp`.
+- The repo already contains an `api_keys` migration in OSS: `apps/server/src/database/migrations/20250912T101500-api-keys.ts`.
+- Generated DB types already include `ApiKeys` in `apps/server/src/database/types/db.d.ts`.
+- `JwtStrategy` supports `JwtType.API_KEY` in type shape, but the actual validation path dynamically requires an EE API key service and fails in OSS.
+- `WorkspaceService` currently license-gates `mcpEnabled`, so OSS MCP enablement must explicitly remove or adjust that gating.
+- The client already has EE-only MCP/settings and API key UI hints, but OSS-ready shared UI does not yet exist.
+- `AuditContext` already supports `actorType: 'api_key'`, which means attribution should extend existing audit plumbing rather than invent a separate model.
+
+## Problem Statement
+
+Docmost OSS currently has partial API-key and MCP-related plumbing, but not a usable OSS-safe implementation.
+
+The missing pieces are:
+
+- OSS-native API key validation
+- explicit per-space grants
+- delegated authorization bounded by the creator's current access
+- a transport-safe MCP module
+- OSS-safe management UI/routes
 
 ## Product Goals
 
-We want an MCP server that allows AI assistants and tools to interact with Docmost content safely.
+The first OSS MCP release should satisfy these goals:
 
-The design must satisfy these requirements:
+- Authentication is done with API keys.
+- API keys are denied all space access by default.
+- Access is granted explicitly per space.
+- Each space grant is `read_only` or `read_write`.
+- The API key can never exceed the creating user's current authority.
+- If the creator loses access, the key loses access immediately for practical purposes.
+- Page-level restrictions must still apply.
+- The implementation should reuse existing Docmost page/space/comment logic instead of duplicating authorization rules inside MCP handlers.
+- The initial OSS launch should favor a smaller secure tool set over broad surface area.
 
-- Authentication is done with API keys
-- API keys are denied access to all spaces by default
-- API keys must be granted access to each space explicitly
-- Each granted space must be either `read_only` or `read_write`
-- The API key must never have more access than the user who created it
-- If the creating user loses access or is downgraded, the API key must lose that access immediately
-- Space access must not bypass page-level restrictions
-- The free version should copy or adapt the existing enterprise MCP capability where possible rather than inventing a parallel product
+## Non-Goals For Initial OSS Launch
 
-## Domain Model
+The first OSS release should not try to solve every possible MCP feature.
 
-The design depends on the existing Docmost content structure:
+Out of scope for initial release:
 
-- A workspace contains spaces
-- A space contains pages
-- A page may have a parent page or `null` parent if it is at the root of the space
-- Spaces already have role-based access via `admin`, `writer`, and `reader`
-- Page-level restrictions can further narrow what a user can see or edit inside a space
-
-This is important because MCP authorization must layer on top of the current Docmost permission model rather than replacing it.
+- service-account-style independent identities
+- workspace-wide implicit access grants
+- broad workspace directory exposure
+- high-risk cross-space structural tools by default
+- full audit-viewer UI redesign
+- a transport design that depends on EE-only framework pieces
 
 ## Core Design Principle
 
-API keys must be treated as delegated credentials, not independent service accounts.
+API keys are delegated credentials, not standalone actors.
 
-The API key does not define authority by itself. It only narrows the authority of the user who created it.
+An API key only narrows the authority of the human creator. It never creates authority on its own.
 
-For any MCP request, effective permission must be the intersection of:
+For any request, effective permission is the intersection of:
 
-- the API key being valid and active
-- the API key having an explicit grant for the target space
-- the requested action fitting within the grant scope
-- the creating user still having the corresponding space access right now
-- the creating user still passing page-level restrictions right now
+- valid active key
+- explicit space grant
+- requested action type
+- creator's current access
+- existing page/comment restrictions
 
-In short: API key permission is always capped by current user permission.
+In other words:
 
-## Effective Permission Rules
+`effective_permission = min(key_grant, creator_current_permission, downstream_resource_rules)`
 
-For each space grant, the key can be configured as one of:
+## Permission Model
+
+## Space grant scopes
+
+Each key-space relationship is one of:
 
 - `read_only`
 - `read_write`
 
-Docmost space roles already imply these capabilities:
+## Creator ceiling
 
-- `reader` -> read only
-- `writer` -> read and write page/comment content
-- `admin` -> read and write, plus space administration abilities in the normal app
-
-The final MCP permission for a tool call is the minimum of:
-
-- the key's configured grant for the space
-- the creator's current effective space role
-- any page-level restriction for the target page or its ancestors
+Creator access is authoritative in real time.
 
 Examples:
 
-- If a key has `read_write` for a space, but the creator is currently only a `reader`, the key becomes effectively read only
-- If a key has `read_only` for a space and the creator is a `writer`, the key still remains read only
-- If the creator loses access to the space entirely, the key becomes unusable for that space
-- If a page is restricted and the creator cannot read it, the key cannot read it either even if the key has a space grant
+- key `read_write` + creator `reader` => effective read only
+- key `read_only` + creator `writer` => effective read only
+- key valid + creator removed from space => no access
+- key valid + creator blocked by page restriction => no access to that page
 
-## Proposed Server Architecture
+## Capability simplification
 
-The MCP implementation should be introduced in OSS as a first-class module and should remain thin.
+For MCP, a minimal capability model is sufficient:
 
-It should not reimplement page, space, comment, or membership rules.
+- `none`
+- `read`
+- `write`
 
-### New OSS Modules
+Map current space roles to MCP capability:
 
-Recommended server areas:
+- `reader` -> `read`
+- `writer` -> `write`
+- `admin` -> `write` for initial MCP tooling unless a specific tool requires admin-only behavior
+
+This avoids over-designing an MCP-specific permission hierarchy that does not exist in the current app.
+
+## Default deny
+
+No space access is inherited from:
+
+- workspace membership alone
+- creator ownership alone
+- historic access at creation time
+- workspace defaults
+
+Only explicit grants count.
+
+## Page restriction rule
+
+Space grants are necessary but not sufficient.
+
+The MCP layer must never become a bypass around `PageAccessService` or equivalent current domain logic.
+
+## Architecture Overview
+
+The design adds two first-class OSS modules:
 
 - `apps/server/src/core/api-key`
 - `apps/server/src/integrations/mcp`
 
-### `ApiKeyModule`
+It also adds supporting repo/migration/audit/throttle integration.
 
-Suggested responsibilities:
-
-- create API keys
-- revoke API keys
-- rotate API keys later if needed
-- store hashed key secrets
-- resolve a presented bearer token to an API key record
-- load per-space grants for the key
-- compute effective access based on current creator permissions
-- expose a machine principal for MCP requests
-
-Suggested files:
-
-- `api-key.module.ts`
-- `api-key.service.ts`
-- `api-key.repo.ts`
-- `dto/*`
-- `types/*`
-
-### `McpModule`
-
-Suggested responsibilities:
-
-- serve the MCP endpoint
-- register MCP tools and their schemas
-- authenticate requests using API keys
-- build a request-scoped MCP execution context
-- route tool calls into existing domain services
-- map internal exceptions into MCP-safe errors
-
-Suggested files:
-
-- `mcp.module.ts`
-- `mcp.controller.ts` or transport-specific entrypoint
-- `mcp.service.ts`
-- `mcp.registry.ts`
-- `tools/*`
-- `auth/*`
-
-### `McpAuthorizationService`
-
-This should be a dedicated service rather than scattered checks in every tool handler.
+## `ApiKeyModule`
 
 Responsibilities:
 
-- classify tool calls as read or write
-- resolve the relevant space for the request
-- verify explicit API key grant
-- determine the creator's current effective access in that space
-- ensure the action does not exceed the effective capability
-- ensure page-level restrictions are still enforced by the downstream service path
+- create keys
+- list keys
+- update metadata and grants
+- revoke keys
+- validate opaque bearer tokens
+- load grants
+- construct the MCP principal
+- throttle `last_used_at` updates
+
+This module is an OSS business capability and belongs under `core`, not hidden behind `ee`.
+
+## `McpModule`
+
+Responsibilities:
+
+- mount transport at `/mcp`
+- authenticate requests using API keys
+- expose tools/resources/prompts
+- build request-scoped execution context
+- delegate into current domain services
+- normalize protocol-safe errors
+- apply truncation and throttling
+
+This belongs under `integrations` because it is a protocol/interface layer over existing domains.
+
+## Why split `core/api-key` from `integrations/mcp`
+
+- API keys may later support non-MCP automations.
+- MCP should not own persistence or lifecycle for credentials.
+- This mirrors the repo's existing pattern of keeping product capability and integration surface separate.
 
 ## Authentication Design
 
-### Current Repository State
+## Opaque token format
 
-Today, `JwtStrategy` supports `JwtType.API_KEY`, but validation only works if the enterprise API key service can be dynamically required. In OSS this fails.
+Use:
 
-That enterprise-only dependency should be removed from the critical authentication path for the free version.
-
-### Recommended Authentication Model
-
-Use opaque API keys as bearer credentials.
-
-Recommended token shape:
-
-- `dmk_<public_id>_<secret>_<checksum>`
+- `dmk_<publicId>_<secret>_<checksum>`
 
 Where:
 
-- `<public_id>` is a non-secret identifier used for lookup
-- `<secret>` is a high-entropy random secret shown only once at creation time
-- `<checksum>` is an HMAC-SHA256 checksum of `public_id + secret` using a server-side secret, truncated to a short stable prefix (for example, the first 8 hex characters) so the server can reject malformed keys before database lookup or expensive hash verification
+- `publicId` is non-secret and used for lookup
+- `secret` is high-entropy random material shown once
+- `checksum` is a short HMAC-derived fast-fail suffix
 
+## Why opaque tokens, not JWTs, for initial MCP
 
+The repo already has JWT payload types for API keys, but the current working validation path is EE-bound.
 
-### Storage Requirements
+For OSS MCP, opaque tokens are preferable because they:
 
-Store:
+- avoid coupling MCP auth to the existing browser/session JWT flow
+- support immediate revocation checks naturally
+- avoid confusion between user sessions and delegated machine credentials
+- fit a dedicated guard/service model cleanly
 
-- API key id
-- workspace id
-- creator user id
-- name
-- optional description
-- token public identifier or prefix
-- hashed secret
-- status
-- expiration timestamp
-- last-used timestamp
-- created and updated timestamps
+## Dedicated MCP auth path
 
-Do not store the plaintext secret.
+Initial OSS MCP should use a dedicated auth guard/service, not the standard JWT guard.
 
-The secret should be hashed using a password-grade algorithm such as Argon2id or bcrypt, depending on what best fits the existing stack.
+Reason:
 
-### Validation Flow
+- MCP traffic is not a browser session
+- the token type is opaque, not a user JWT
+- MCP should not inherit unrelated user-session assumptions
 
-For each MCP request:
+`JwtStrategy` cleanup can happen separately for compatibility, but should not define the transport design.
 
-1. Read bearer token from `Authorization: Bearer <token>` header (standard convention to ensure compatibility with proxies and infrastructure)
-2. Parse token into public identifier and secret
-3. Look up the API key by public identifier
-4. Verify secret hash
-5. Reject if revoked, expired, or otherwise inactive
-6. Resolve creator user and workspace
-7. Resolve the key's configured space grants
-8. Build an MCP principal containing the key id, workspace id, creator user id, and grant information
+## Storage Design
 
-### JWT Compatibility
+## Existing table reuse
 
-The repository already supports API-key JWT payloads, but for OSS MCP the safest initial design is to validate the raw opaque API key on each request.
+The repo already has `api_keys`. The design must extend it.
 
-If the implementation later needs a derived short-lived JWT for internal guard reuse, that JWT must still remain tied to current key state and revocation status.
+Required additional fields:
 
-## Authorization Model
-
-### Default Deny
-
-API keys have zero space access unless a grant is explicitly configured.
-
-No access should be inherited automatically from:
-
-- workspace membership
-- creator ownership
-- creator's general list of spaces
-- historical permissions at the time the key was created
-
-### Per-Space Grants
-
-Each key can have a set of space grants:
-
-- one grant record per space
-- scope is either `read_only` or `read_write`
-
-### Creator Permission Ceiling
-
-The creating user's live access is authoritative.
-
-If the creator is removed from a space, the key loses access to that space.
-
-If the creator is downgraded from `writer` to `reader`, the key immediately loses write access even if the configured grant is still `read_write`.
-
-If the creator is disabled or removed from the workspace entirely, the key should fail closed for all operations.
-
-### Group Membership
-
-Because Docmost already derives space access through direct membership or groups, the effective key permission must use the creator's current highest role via the existing space membership logic.
-
-This means group membership changes must affect key behavior immediately or as close to immediately as existing permission caching allows.
-
-### Page Restrictions
-
-Space grants are necessary but not sufficient.
-
-Page restrictions must still be enforced for:
-
-- `get_page`
-- `search_pages`
-- `list_pages`
-- `list_child_pages`
-- page updates
-- comment operations
-- attachment search and retrieval
-- page moves, copies, and duplication
-
-The MCP layer must not become a bypass around existing page restriction logic.
-
-## Proposed Data Model
-
-### `api_keys`
-
-Suggested fields:
-
-- `id`
-- `workspace_id`
-- `created_by_user_id`
-- `name`
-- `description` nullable
-- `token_prefix` or public identifier
+- `public_id`
 - `secret_hash`
-- `status` such as `active` or `revoked`
-- `expires_at` nullable
-- `last_used_at` nullable (updated via throttled strategy, e.g., only once per hour or asynchronously, to avoid DB write contention)
+- `description`
+- `status`
+- `revoked_at`
+- `revoked_by_user_id`
 
-- `created_at`
-- `updated_at`
-- `revoked_at` nullable
-- `revoked_by_user_id` nullable
-
-Suggested constraints:
-- `created_by_user_id` should have `ON DELETE CASCADE` or a corresponding hook in `ApiKeyModule` to ensure all keys are revoked if the creator account is deleted.
-
-Suggested indexes:
-
-
-- unique index on public identifier
-- index on `(workspace_id, status)`
-- index on `created_by_user_id`
-
-### `api_key_space_grants`
-
-Suggested fields:
+Existing fields to keep using:
 
 - `id`
-- `api_key_id`
-- `space_id`
-- `scope` with values `read_only` or `read_write`
+- `creator_id`
+- `workspace_id`
+- `name`
+- `expires_at`
+- `last_used_at`
 - `created_at`
 - `updated_at`
+- `deleted_at`
 
-Suggested constraints and indexes:
+## Grant table
 
-- unique `(api_key_id, space_id)`
-- foreign key to `api_keys`
-- foreign key to `spaces`
-- index on `space_id`
+Use a separate `api_key_space_grants` table rather than JSON-in-row storage.
 
-### Why Separate Grant Records
+Why:
 
-This keeps the permission model explicit and easy to audit.
+- explicit auditability
+- easier UI editing
+- simple uniqueness rules
+- simple joins for access resolution
 
-It also makes it straightforward to show configured access in the UI and compare it to currently effective access.
+## Transport Design
 
-## MCP Transport
+## Endpoint
 
-The repository should expose MCP over HTTP at a stable endpoint, likely `/mcp` or `/api/mcp` depending on current routing conventions.
+Mount MCP at `/mcp`.
 
-The transport layer should stay replaceable. The implementation should not entangle business rules with a specific MCP SDK.
+This is the correct default because `main.ts` already excludes `mcp` from the `/api` prefix.
 
-At a high level:
+## Response envelope compatibility
 
-1. Client connects to MCP endpoint
-2. Client authenticates with API key
-3. MCP server resolves the execution context
-4. Tool handler validates input
-5. Authorization service checks access
-6. Existing domain service executes the operation
-7. Result is returned in MCP-compliant format
+The standard app API wraps responses via `TransformHttpResponseInterceptor`.
 
-## MCP Ecosystem Capabilities
+MCP transport may require raw protocol envelopes. Therefore, MCP routes must explicitly bypass or avoid the standard API response wrapper if required by the chosen SDK/transport.
 
-### Resources
+This is a design-critical requirement, not an implementation detail to discover late.
 
-The server should expose Docmost content as MCP resources in addition to tools so clients can browse content instead of only invoking point reads.
+## Transport replaceability
 
-- Map pages to stable resource URIs such as `docmost://spaces/{spaceId}/pages/{pageId}`.
-- Expose space and page hierarchy resources where useful for navigation and tree browsing.
-- Resource reads must obey the same permission checks as tools, including creator ceiling and page restrictions.
-- Resource subscriptions, if supported by the transport layer, should be limited to safe metadata or change notifications and must not leak restricted content.
+Business rules must not be tied to a specific SDK.
 
-### Prompts
+The design should isolate:
 
-The server should expose a small prompt library to guide common Docmost workflows.
+- transport/controller concerns
+- registry/descriptor concerns
+- auth concerns
+- authorization concerns
+- domain delegation
 
-- `summarize_space`
-- `find_stale_pages`
-- `onboard_new_member`
-- `draft_design_page`
+So that the underlying MCP transport implementation can be changed without rewriting authorization and tool logic.
 
-Prompts should be kept lightweight and should compose with existing tools and resources rather than duplicate business logic.
+## Request Lifecycle
 
-## Tool Design
+1. request hits `/mcp`
+2. MCP auth guard extracts bearer token
+3. `ApiKeyService` validates token and loads grants
+4. MCP principal is attached to the request
+5. registry resolves target tool
+6. authorization service computes effective capability
+7. context factory builds creator-backed execution context
+8. existing domain services perform the operation
+9. result is truncated/sanitized if needed
+10. audit event is recorded
+11. protocol response is returned
 
-The current UI already lists the intended tool set:
+## Domain Delegation Rule
 
-- `search_pages`
-- `get_page`
-- `create_page`
-- `update_page`
-- `list_pages`
-- `list_child_pages`
-- `duplicate_page`
-- `copy_page_to_space`
-- `move_page`
-- `move_page_to_space`
-- `get_space`
-- `list_spaces`
-- `create_space`
-- `update_space`
-- `get_comments`
-- `create_comment`
-- `update_comment`
-- `search_attachments`
-- `list_workspace_members`
-- `get_current_user`
+The MCP layer must stay thin.
 
-The sections below define intended behavior, minimum input expectations, and authorization rules.
+It should not:
 
-### Actor Attribution and Audit
+- reimplement page visibility
+- reimplement comment edit rules
+- duplicate space membership resolution
+- create a parallel page tree engine
 
-When an action is performed via an API key, the system must track both the human creator and the specific key used.
+It should:
 
-- **Attribution**: Actions (e.g., creating a comment, updating a page) should be tagged with the `apiKeyId` in the database/audit logs.
-- **UI Transparency**: In the user interface, actions performed via MCP should be visually distinguished (e.g., `Creator Name (via AI)`) to ensure transparency.
-- **Tool Usage Logging**: Every successful and failed tool call must be logged, including `toolName`, `targetResourceId` (e.g., `pageId`), and `apiKeyId`.
+- authorize the request at the key/grant level
+- construct proper execution context
+- call the same service/repo paths used by the normal app where possible
 
-### Authorization Latency & Caching
+## Audit and Attribution Design
 
-Because effective access must be lost "immediately" upon creator downgrade:
+## Existing audit reuse
 
-- The `McpAuthorizationService` must ensure it does not rely on stale permission caches for high-security write operations.
-- If standard permission caching is used, the implementation must ensure that membership/role changes trigger immediate cache invalidation for associated API keys.
+The repo already has centralized audit patterns and `AuditContext` with `actorType: 'api_key'` support.
 
-### Search Scope & Performance
+The design should extend this path by adding optional `apiKeyId` tracking rather than creating a fully separate audit system.
 
-To prevent resource exhaustion when searching across many granted spaces:
+## Attribution rule
 
-- Introduce a `MAX_SPACES_PER_SEARCH` limit for a single search request.
-- Recommended default: `20` spaces per broad search.
-- Enforce strict timeouts at the transport layer for search operations.
+For MCP-originated actions:
 
-### Tool Response Size Constraints
+- actor remains attributable to the human creator
+- the active key id must also be recorded
+- the request must be marked as machine-mediated
 
-To prevent transport failures or AI context window overflow:
+Recommended audit context fields:
 
-- The MCP server must truncate tool outputs at a safe limit (e.g., 100KB).
-- When truncation occurs, the response must include a truncated indicator so the AI knows it only has a partial view of the content.
+- `actorId = creator user id`
+- `actorType = 'api_key'`
+- `apiKeyId = active key id`
 
-## Common Tool Rules
+## Audit event model
 
+Add MCP-specific events into the existing audit vocabulary:
 
+- `mcp.tool.invoked`
+- `mcp.tool.succeeded`
+- `mcp.tool.denied`
+- `mcp.tool.failed`
 
-### Read vs Write Classification
+Do not require a dedicated `mcp_audit_events` table for the first OSS release unless the current audit sink cannot hold the needed metadata.
 
-Read tools:
+## Performance and Abuse Controls
 
-- `search_pages`
-- `get_page`
-- `list_pages`
-- `list_child_pages`
-- `get_space`
-- `list_spaces`
-- `get_comments`
-- `search_attachments`
-- `list_workspace_members`
-- `get_current_user`
+## `last_used_at`
 
-Write tools:
+Do not write on every request.
 
-- `create_page`
-- `update_page`
-- `duplicate_page`
-- `copy_page_to_space`
-- `move_page`
-- `move_page_to_space`
-- `create_space`
-- `update_space`
-- `create_comment`
-- `update_comment`
+Use throttled updates, ideally at most once per hour per key.
 
-### Error Model
+## Search breadth
 
-Recommended normalized errors:
+Broad search across many granted spaces is expensive.
+
+Add:
+
+- `MAX_SPACES_PER_SEARCH`, recommended default `20`
+
+If the request omits `spaceId` and the key has more than the allowed number of readable spaces, fail the request or require narrowing.
+
+## Response size
+
+Large page bodies and search results must be truncated.
+
+Initial safe defaults:
+
+- max text content: 100 KB
+- max list size: 50 items
+
+Responses should clearly indicate truncation.
+
+## Rate limiting
+
+Use the repo's existing throttling infrastructure.
+
+Initial concept:
+
+- per IP limit
+- per key limit
+- stricter write limits than read limits
+
+## Error Model
+
+Use normalized MCP-safe errors:
 
 - `UNAUTHENTICATED`
 - `FORBIDDEN`
@@ -467,566 +397,214 @@ Recommended normalized errors:
 - `RATE_LIMITED`
 - `INTERNAL_ERROR`
 
-To avoid unauthorized resource enumeration, prefer `NOT_FOUND` when revealing the existence of an object would leak information.
+Resource enumeration rule:
 
-## Page Tools
+- prefer `NOT_FOUND` when revealing resource existence would leak information
 
-### `search_pages`
+## Tool Design
 
-Purpose:
+## Initial OSS tool set
 
-- search pages by keyword within authorized spaces
+The first OSS launch should include:
 
-Minimum inputs:
+- `get_current_user`
+- `list_spaces`
+- `get_space`
+- `get_page`
+- `list_pages`
+- `list_child_pages`
+- `search_pages`
+- `get_comments`
+- `create_page`
+- `update_page`
+- `create_comment`
+- `update_comment` only if current comment rules map cleanly to delegated actor behavior
 
-- `query`
-- optional `spaceId`
-- optional pagination
+## Deferred tools
 
-Recommended enhancements:
+Defer initially:
 
-- fuzzy matching on page titles and common aliases
-- support `title_only` and `content_only` filters
-- support `lastModifiedBy` and `updatedSince` metadata filters
-- include breadcrumb/path context in results when available
+- `create_space`
+- `update_space`
+- `duplicate_page`
+- `move_page`
+- `copy_page_to_space`
+- `move_page_to_space`
+- `search_attachments`
+- `list_workspace_members`
 
-Authorization:
+Reasons:
 
-- if `spaceId` is supplied, the key must have readable access to that space
-- if `spaceId` is omitted, search must be restricted to the set of granted readable spaces only
-- page-level restrictions still apply to every result
+- poor fit to per-space grant model
+- exfiltration risk
+- directory leakage risk
+- cross-space integrity complexity
 
-Constraints:
-
-- no results from ungranted spaces
-- no snippets from unauthorized pages
-- no unauthorized hit counts
-
-If the search is broad and spans multiple granted spaces, the implementation should enforce a `MAX_SPACES_PER_SEARCH` limit to prevent resource exhaustion.
-
-Recommended response shape:
-
-- `path` breadcrumb array when available
-- `matchedOn` field to indicate title vs content match
-- truncated result metadata when the response exceeds safe limits
-
-### `get_page`
-
-Purpose:
-
-- return page content and metadata for a specific page
-
-Minimum inputs:
-
-- `pageId`
-
-Authorization:
-
-- page's space must be granted for read
-- creator must currently be able to read the page
-- page restriction logic must still be applied
-
-Recommended response metadata:
-
-- page outline / heading structure summary
-- path breadcrumbs within the space
-- last updated metadata
-
-### `create_page`
-
-Purpose:
-
-- create a page in a space
-
-Minimum inputs:
-
-- `spaceId`
-- `title`
-- optional `content`
-- optional `parentPageId`
-
-Authorization:
-
-- key must have `read_write` grant for the target space
-- creator must currently have write capability in that space
-- if a parent page is provided, creator must be able to create under that page
-
-### `update_page`
-
-Purpose:
-
-- update an existing page's title or content
-
-Minimum inputs:
-
-- `pageId`
-- at least one field to update
-
-Authorization:
-
-- key must have `read_write` grant for the page's space
-- creator must currently be able to edit the page
-
-Safety requirements:
-
-- use optimistic locking or equivalent conflict detection to avoid overwriting concurrent human edits
-- if the editor stack supports collaborative document operations, prefer patching the active document model instead of replacing the full page body
-
-### Additional Read Tools
-
-- `get_page_by_path` — resolve a hierarchical path like `/Engineering/Design/MCP-Server` to a page
-- `list_pages_recursive` — return a condensed tree view of pages in a space, bounded by depth and node count
-- `list_recent_activity` — return recent page changes for a space or workspace
-- `get_page_outline` — return headings and section anchors for a page
-
-### `list_pages`
-
-Purpose:
-
-- list pages in a space
-
-Minimum inputs:
-
-- `spaceId`
-- optional pagination
-
-Authorization:
-
-- readable grant on the target space
-- results filtered through page visibility rules
-
-### `list_child_pages`
-
-Purpose:
-
-- list child pages of a specific page
-
-Minimum inputs:
-
-- `parentPageId`
-
-Authorization:
-
-- parent page must be visible
-- returned children must also be visible under page restriction rules
-
-### `duplicate_page`
-
-Purpose:
-
-- duplicate a page within its space
-
-Minimum inputs:
-
-- `pageId`
-- optional destination parent if supported by current page service
-
-Authorization:
-
-- read access to the source page
-- write access to the destination location
-
-Security note:
-
-- this tool becomes much riskier if it duplicates descendants with mixed page-level visibility
-
-### `copy_page_to_space`
-
-Purpose:
-
-- copy a page to a different space
-
-Minimum inputs:
-
-- `pageId`
-- `targetSpaceId`
-- optional `targetParentPageId`
-
-Authorization:
-
-- readable access to the source page and source space
-- writable access to the target space and target parent if provided
-
-Security note:
-
-- this is a major exfiltration vector and should be treated as a high-risk tool
-
-### `move_page`
-
-Purpose:
-
-- move a page within a space or within an allowed page tree context
-
-Minimum inputs:
-
-- `pageId`
-- destination parent or position info
-
-Authorization:
-
-- write access to the page
-- write access to the destination location
-
-### `move_page_to_space`
-
-Purpose:
-
-- move a page to a different space
-
-Minimum inputs:
-
-- `pageId`
-- `targetSpaceId`
-- optional destination parent
-
-Authorization:
-
-- write access to the source page
-- write access to the target space
-
-Security note:
-
-- this is also high-risk because it combines integrity changes with possible cross-space data movement
-
-## Space Tools
-
-### `get_space`
-
-Purpose:
-
-- return details of a specific space
-
-Minimum inputs:
-
-- `spaceId`
-
-Authorization:
-
-- readable grant on the target space
-
-### `list_spaces`
-
-Purpose:
-
-- list spaces the API key can currently access
-
-Minimum inputs:
-
-- none
-
-Authorization:
-
-- authenticated API key
-
-Constraints:
-
-- only spaces explicitly granted to the key and still accessible to the creator should be returned
-
-### `create_space`
-
-Purpose:
-
-- create a new space
-
-Problem:
-
-- this does not map cleanly onto a per-space grant model because the target space does not exist yet
-
-Recommendation:
-
-- do not include `create_space` in the initial OSS launch unless a separate workspace-level permission model is intentionally added
-
-### `update_space`
-
-Purpose:
-
-- update a space's name or description
-
-Minimum inputs:
-
-- `spaceId`
-- fields to update
-
-Authorization:
-
-- `read_write` grant on the space is not enough by itself
-- creator should also currently be a space `admin` if the existing domain rules require admin-level space management
-
-## Comment Tools
-
-### `get_comments`
-
-Purpose:
-
-- return comments for a page
-
-Minimum inputs:
-
-- `pageId`
-
-Authorization:
-
-- readable access to the page
-
-### `create_comment`
-
-Purpose:
-
-- add a comment to a page
-
-Minimum inputs:
-
-- `pageId`
-- `content`
-
-Authorization:
-
-- `read_write` grant for the page's space
-- creator must currently be allowed to comment on that page
-- any viewer-comment or page-level comment setting must still apply
-
-### `update_comment`
-
-Purpose:
-
-- update an existing comment
-
-Minimum inputs:
-
-- `commentId`
-- updated content
-
-Authorization:
-
-- `read_write` grant for the related space
-- comment edit rules already used by the main app must still apply
-
-## Other Tools
-
-### `search_attachments`
-
-Purpose:
-
-- search attachments across accessible content
-
-Minimum inputs:
-
-- `query`
-- optional `spaceId`
-
-Authorization:
-
-- readable space access
-- attachment access must remain tied to page visibility or equivalent attachment-level authorization
-
-Security note:
-
-- attachment metadata can itself be sensitive and this tool should be treated carefully
-
-### `list_workspace_members`
-
-Purpose:
-
-- return workspace members the caller is allowed to view
-
-Security note:
-
-- this is not naturally space-scoped and can expose directory information such as names and emails
-
-Recommendation:
-
-- defer this tool from the initial OSS launch unless the product explicitly wants machine access to workspace directory data and the permission model is tightened for it
+## Tool-specific design notes
 
 ### `get_current_user`
 
-Purpose:
-
-- return the authenticated identity context for the API key
-
-Recommendation:
-
-- return an API-key principal view rather than pretending this is a browser user session
+Return a principal view, not a user-session DTO.
 
 Suggested fields:
 
-- `type: "api_key"`
+- `type: 'api_key'`
 - `apiKeyId`
 - `apiKeyName`
 - `workspaceId`
 - `createdByUserId`
 - `createdByDisplayName`
 
-## Recommended Initial OSS Tool Set
+### `list_spaces`
 
-Based on the architecture and security review, the first OSS launch should be narrower than the full enterprise list.
+- return only explicitly granted spaces still visible to the creator
+- never derive from all workspace memberships automatically
 
-Recommended initial tools:
+### `get_space`
 
-- `get_current_user`
-- `get_space`
-- `list_spaces`
-- `get_page`
-- `search_pages`
-- `list_pages`
-- `list_child_pages`
-- `get_comments`
-- `create_page`
-- `update_page`
-- `create_comment`
-- `update_comment`
+- require readable grant on that space
 
-Recommended to defer until the permission model is proven in OSS:
+### `get_page`
 
-- `duplicate_page`
-- `copy_page_to_space`
-- `move_page`
-- `move_page_to_space`
-- `create_space`
-- `update_space`
-- `search_attachments`
-- `list_workspace_members`
+- page must belong to a granted space
+- creator must currently be able to view it
+- page restriction logic must still run through existing domain code
 
-This does not mean those tools are impossible. It means they are higher risk and should follow after the base auth model is validated.
+### `list_pages`
+
+- require `spaceId`
+- filter results by visibility
+
+### `list_child_pages`
+
+- require visible parent page
+- invisible parent should behave as not found
+
+### `search_pages`
+
+- restrict to granted spaces only
+- no unauthorized snippets, counts, or hits
+- broad search must obey `MAX_SPACES_PER_SEARCH`
+
+### `create_page`
+
+- require write grant on target space
+- if parent provided, creator must be allowed to create under that parent
+
+### `update_page`
+
+- require write grant on page's space
+- creator must currently be able to edit the page
+- use optimistic concurrency for stale-write protection
+
+### `get_comments`, `create_comment`, `update_comment`
+
+- all comment operations remain subordinate to page visibility and current comment business rules
+- if comment update semantics prove user-author-bound in a way that cannot safely support delegated editing, defer `update_comment`
+
+## Resources and Prompts
+
+These are useful but should remain lightweight in the first OSS delivery.
+
+## Resources
+
+Recommended initial resource form:
+
+- `docmost://spaces/{spaceId}/pages/{pageId}`
+
+Rules:
+
+- same auth checks as tools
+- no restricted content leakage
+
+## Prompts
+
+Prompts should be thin wrappers around tools/resources, not a second business-logic system.
+
+Examples that are acceptable later:
+
+- `summarize_space`
+- `draft_design_page`
+
+But prompts must not delay core transport/tool delivery.
 
 ## UI and Admin Requirements
 
-The OSS client will need API key management and MCP settings moved out of enterprise-only paths or reimplemented in shared OSS-safe locations.
+OSS will need shared, non-EE client surfaces for:
 
-### Minimum UI Requirements
-
-- MCP settings page showing endpoint URL
-- API key list page
-- create API key flow
-- one-time key reveal screen
-- revoke key action
+- API key list
+- create key flow
+- one-time secret reveal
+- revoke action
 - per-space grant editor
-- visible grant scope selector with `Read Only` and `Read and Write`
-- warnings when configured access exceeds currently effective access due to creator downgrade
+- MCP endpoint display
 
-### Validation Requirements
-
-During key creation or update:
-
-- the server must reject any requested grant the creator cannot currently hold
-- the UI should also prevent obvious invalid combinations for usability, but server-side validation remains authoritative
+The current EE-only client components can inform the design, but OSS-critical surfaces must move into shared client code.
 
 ## Security Requirements
 
-The security review produced the following non-negotiable requirements for launch.
+These are mandatory for the first OSS release.
 
-### API Key Lifecycle
+### API key lifecycle
 
 - high-entropy generated secrets
-- hashed secret storage
+- secret hashing with an explicitly chosen dependency/algorithm
 - plaintext shown once only
 - immediate revocation
-- optional or default expiration support
-- no logging of full key values
-- audit logging for create, revoke, grant changes, and sensitive MCP actions
+- optional/default expiration support
+- no full-key logging
 
-### Authorization Invariants
+### Authorization invariants
 
-- explicit per-space default deny
-- no workspace-wide implied access
-- creator permission is always the upper bound
-- page restrictions always override space grants
-- cross-space operations require authorization on both source and destination
-- workspace binding must be enforced for every request
+- default deny
+- explicit per-space grants only
+- creator is always the ceiling
+- page restrictions always apply
+- workspace binding enforced on every request
 
-### Safe Error Behavior
+### Abuse controls
 
-- invalid, revoked, and expired keys should fail with generic authentication errors
-- unauthorized objects should usually return `NOT_FOUND` rather than revealing they exist
-- search and list operations must not leak unauthorized counts or snippets
+- per-key throttling
+- per-IP throttling
+- stricter write throttles
+- truncation and pagination caps
 
-### Abuse Controls
+## Implementation Strategy Summary
 
-- per-key rate limiting
-- per-IP rate limiting
-- stricter limits for write tools than read tools
-- size and pagination caps for search and list operations
-- operational protections around expensive tree operations when they are introduced
+Recommended sequence:
 
-## Implementation Approach
+1. extend OSS API key storage and management
+2. add dedicated MCP auth guard/service
+3. implement delegated authorization service
+4. mount raw-compatible MCP transport at `/mcp`
+5. ship read tools first
+6. add mutation tools after conflict/audit tests pass
+7. add OSS-safe UI surfaces
 
-The best path is incremental rather than trying to port the entire enterprise MCP feature set in one pass.
+## Verification Requirements
 
-### Phase 1: OSS API Key Foundation
+Before launch, validate:
 
-- create OSS `ApiKeyModule`
-- add database tables for API keys and per-space grants
-- implement create, list, revoke, and update endpoints
-- replace enterprise-only API key validation path in auth with an OSS-native implementation
+- valid/revoked/expired/malformed key behavior
+- creator downgrade and removal behavior
+- page restriction enforcement under MCP
+- response truncation behavior
+- rate limiting behavior
+- protocol response shape compatibility
+- audit attribution with `actorType: 'api_key'`
 
-### Phase 2: Effective Permission Engine
+## Final Recommendation
 
-- implement `McpAuthorizationService`
-- integrate creator role resolution using current membership logic
-- add tests for downgrade, removal, group membership changes, and page restrictions
+The strongest OSS design is not a wholesale enterprise copy.
 
-### Phase 3: MCP Transport
+It is a thin integration layer that:
 
-- implement `McpModule`
-- add endpoint and tool registration
-- wire request auth and error mapping
+- extends the existing OSS `api_keys` foundation
+- uses explicit per-space grants
+- treats keys as delegated credentials
+- mounts MCP at `/mcp` to match current bootstrap behavior
+- relies on current page/space/comment services for real authorization decisions
+- reuses the current audit and throttling infrastructure
+- ships a narrow, high-confidence tool set first
 
-### Phase 4: Read-Focused MCP Launch
-
-- ship lower-risk tools first
-- verify logs, audit events, and rate limits
-
-### Phase 5: Write Tools
-
-- add page and comment mutation tools
-- validate write authorization thoroughly
-
-### Phase 6: Higher-Risk Tools
-
-- revisit cross-space copy/move, space management, attachments, and workspace member tools only after the base system is stable
-
-## Testing Requirements
-
-The following cases should be covered before launch.
-
-### Authentication Tests
-
-- valid key works
-- invalid key fails
-- revoked key fails immediately
-- expired key fails immediately
-
-### Authorization Tests
-
-- no grant means no access
-- `read_only` key cannot perform writes
-- `read_write` key can perform writes only when creator can too
-- creator downgrade immediately reduces access
-- creator removal immediately removes access
-- group membership changes affect key access correctly
-
-### Data Leakage Tests
-
-- unauthorized spaces do not appear in `list_spaces`
-- unauthorized pages do not leak through `get_page`
-- restricted pages do not leak through `search_pages`
-- restricted child pages do not leak through `list_child_pages`
-- attachments do not leak metadata without authorization
-
-### Write Integrity Tests
-
-- page updates respect page-level restrictions
-- comment updates respect current edit rules
-- future move/copy tools enforce both source and destination permissions
-
-## Final Recommendations
-
-The recommended plan is:
-
-- implement API keys in OSS as a first-class capability
-- model per-space grants explicitly with default deny
-- treat API keys as delegated credentials whose effective power is always capped by the creator's current access
-- reuse existing Docmost service logic for page, space, and comment behavior instead of copying business rules into MCP handlers
-- ship a smaller initial MCP tool set focused on core read and basic write operations
-- defer cross-space and directory-style tools until the auth model is fully tested in OSS
-
-This gives Docmost a practical MCP foundation for AI usage without creating a security bypass around the repository's existing permission system.
+That approach is the most secure and the best fit for Docmost's current architecture.
