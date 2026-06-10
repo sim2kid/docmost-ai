@@ -98,6 +98,7 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - Implement the MCP HTTP endpoint (e.g., `/api/mcp`).
 - Implement the MCP transport adapter (JSON-RPC / SSE).
 - Create the `McpRegistry` to map tool names to handler functions.
+- Add support for MCP `resources` and `prompts` alongside tools so clients can browse content and use guided workflows.
 
 ### 3.2 Request Lifecycle
 - Auth Guard -> `ApiKeyModule` -> `McpPrincipal` creation.
@@ -145,12 +146,29 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - `list_pages`
 - `list_child_pages`
 
+### 4.1.1 MCP Resources
+- Expose page resources using stable URIs such as `docmost://spaces/{spaceId}/pages/{pageId}`.
+- Expose hierarchy/navigation resources where helpful for tree browsing.
+- Keep resource reads subject to the same authorization and page restriction checks as tools.
+
+### 4.1.2 MCP Prompts
+- `summarize_space`
+- `find_stale_pages`
+- `onboard_new_member`
+- `draft_design_page`
+- Prompts should remain thin wrappers around tools and resources, not new business logic.
+
 ### 4.2 Search & Discovery Tools
 - `search_pages` (with space filtering and result caps).
     - **Space Limit**: When the caller does not supply a `spaceId` (i.e., a global search), the handler must validate `spaceIds.length` (derived from the key's grants) against a `MAX_SPACES_PER_SEARCH` constant (e.g., 20). If exceeded, reject the call with `FORBIDDEN` to prevent resource exhaustion.
     - **Result Limit**: Apply the `McpResponseTruncator` (Phase 3.3) to cap returned hits.
+    - **Search Quality**: Support fuzzy title matching, `title_only` / `content_only` filters, `lastModifiedBy`, `updatedSince`, and breadcrumb/path metadata in results.
 - `get_comments`
 - `search_attachments` (with strict visibility checks).
+- `get_page_by_path`
+- `list_pages_recursive`
+- `list_recent_activity`
+- `get_page_outline`
 
 ---
 
@@ -162,6 +180,9 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - `update_page`
 - `create_comment`
 - `update_comment`
+
+- `update_page` must support optimistic concurrency via `version` or `updatedAt` checks so AI edits do not overwrite concurrent human edits.
+- If the editor stack exposes a collaborative document patch path, prefer that over full-body replacement.
 
 ### 5.2 Structural Tools (High Risk)
 - `duplicate_page`
@@ -179,6 +200,12 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - Space grant editor (with "Effective Access" warnings).
 - Key list and revocation interface.
 
+### 6.3 Search/Navigation UX
+- Display breadcrumb/path context in search results.
+- Distinguish title matches from content matches.
+- Surface a concise page outline for quick jumping.
+- Provide recent-activity views to support AI and human discovery.
+
 ### 6.2 MCP Settings UI
 - Endpoint URL display.
 - Tool capability overview.
@@ -192,7 +219,7 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 - [ ] **Restrictions**: Restricted pages are hidden from `get_page` and `search_pages`.
 - [ ] **Leakage**: `list_spaces` only shows granted spaces.
 - [ ] **Performance**: Search across 10+ spaces does not timeout or crash.
-- [ ] **Attribution**: Page updates via MCP are tagged with `apiKeyId`.
+- [ ] **Attribution**: Page updates via MCP are tagged with `apiKeyId` and surfaced as `wasAIGenerated` in supported UI responses.
 - [ ] **Truncation**: 1MB page content returned via `get_page` is truncated to 100KB with a marker.
 - [ ] **Throttling**: 100 rapid requests do not result in 100 `last_used_at` DB writes.
 - [ ] **Audit**: Denied tool calls appear in `mcp_audit_events` with reason codes.
@@ -202,7 +229,7 @@ The implementation follows a phased approach to minimize risk, ensuring that the
 To ensure the foundation is solid before building the UI or exposing tools, the implementation is gated by three verification checkpoints.
 
 ### Checkpoint 1: The Bearer Test (Post-Phase 1)
-- **Test**: Create an API key directly via the `ApiKeyService` (or SQL), then send a `GET /api/mcp/health` request with the `X-API-Key` header.
+- **Test**: Create an API key directly via the `ApiKeyService` (or SQL), then send a `GET /api/mcp/health` request with the `Authorization: Bearer <token>` header.
 - **What it Validates**:
     - Token generation and parsing.
     - Checksum logic (rejects malformed tokens without DB lookup).

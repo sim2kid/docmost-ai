@@ -344,6 +344,28 @@ At a high level:
 6. Existing domain service executes the operation
 7. Result is returned in MCP-compliant format
 
+## MCP Ecosystem Capabilities
+
+### Resources
+
+The server should expose Docmost content as MCP resources in addition to tools so clients can browse content instead of only invoking point reads.
+
+- Map pages to stable resource URIs such as `docmost://spaces/{spaceId}/pages/{pageId}`.
+- Expose space and page hierarchy resources where useful for navigation and tree browsing.
+- Resource reads must obey the same permission checks as tools, including creator ceiling and page restrictions.
+- Resource subscriptions, if supported by the transport layer, should be limited to safe metadata or change notifications and must not leak restricted content.
+
+### Prompts
+
+The server should expose a small prompt library to guide common Docmost workflows.
+
+- `summarize_space`
+- `find_stale_pages`
+- `onboard_new_member`
+- `draft_design_page`
+
+Prompts should be kept lightweight and should compose with existing tools and resources rather than duplicate business logic.
+
 ## Tool Design
 
 The current UI already lists the intended tool set:
@@ -459,6 +481,13 @@ Minimum inputs:
 - optional `spaceId`
 - optional pagination
 
+Recommended enhancements:
+
+- fuzzy matching on page titles and common aliases
+- support `title_only` and `content_only` filters
+- support `lastModifiedBy` and `updatedSince` metadata filters
+- include breadcrumb/path context in results when available
+
 Authorization:
 
 - if `spaceId` is supplied, the key must have readable access to that space
@@ -470,6 +499,14 @@ Constraints:
 - no results from ungranted spaces
 - no snippets from unauthorized pages
 - no unauthorized hit counts
+
+If the search is broad and spans multiple granted spaces, the implementation should enforce a `MAX_SPACES_PER_SEARCH` limit to prevent resource exhaustion.
+
+Recommended response shape:
+
+- `path` breadcrumb array when available
+- `matchedOn` field to indicate title vs content match
+- truncated result metadata when the response exceeds safe limits
 
 ### `get_page`
 
@@ -486,6 +523,12 @@ Authorization:
 - page's space must be granted for read
 - creator must currently be able to read the page
 - page restriction logic must still be applied
+
+Recommended response metadata:
+
+- page outline / heading structure summary
+- path breadcrumbs within the space
+- last updated metadata
 
 ### `create_page`
 
@@ -521,6 +564,18 @@ Authorization:
 
 - key must have `read_write` grant for the page's space
 - creator must currently be able to edit the page
+
+Safety requirements:
+
+- use optimistic locking or equivalent conflict detection to avoid overwriting concurrent human edits
+- if the editor stack supports collaborative document operations, prefer patching the active document model instead of replacing the full page body
+
+### Additional Read Tools
+
+- `get_page_by_path` — resolve a hierarchical path like `/Engineering/Design/MCP-Server` to a page
+- `list_pages_recursive` — return a condensed tree view of pages in a space, bounded by depth and node count
+- `list_recent_activity` — return recent page changes for a space or workspace
+- `get_page_outline` — return headings and section anchors for a page
 
 ### `list_pages`
 
